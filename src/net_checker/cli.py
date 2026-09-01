@@ -42,6 +42,22 @@ GAP = "GAP"        # ts (recovery), duration, probes left unanswered
 SKEW = "SKEW"      # ts, duration, 0 - silence with nothing lost: a clock step or
                    #     a stalled process, never an outage
 RESTART = "RESTART"  # ts, reason
+KINDS = {PING, LOSS, SLICE, GAP, SKEW, RESTART}
+
+# Every record is written as: ts <TAB> lane <TAB> kind <TAB> fields...
+WAN = "wan"        # the internet probe
+LAN = "lan"        # the gateway probe, the control that says who is at fault
+
+
+def default_gateway() -> str | None:
+    """The next hop out of this machine, so we can tell the LAN from the ISP."""
+    try:
+        out = subprocess.run(["ip", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"default via (\S+)", out)
+    return match[1] if match else None
 
 
 # --------------------------------------------------------------------------- #
@@ -73,7 +89,17 @@ def clock(ts: float, tz: tzinfo, with_date: bool) -> str:
     return moment.strftime("%m-%d %H:%M:%S.%f" if with_date else "%H:%M:%S.%f")[:-3]
 
 
-def outage_lines(gaps: list[tuple[float, float]], tz: tzinfo, limit: int = 10) -> list[str]:
+def blame(start: float, end: float, lan_gaps: list[tuple[float, float]] | None) -> str:
+    """Was the gateway reachable while the internet was not?"""
+    if lan_gaps is None:
+        return ""
+    if any(ls < end and le > start for ls, le in lan_gaps):
+        return "  [gateway unreachable too -> your LAN or this machine, not the ISP]"
+    return "  [gateway stayed up -> the fault is upstream of your router]"
+
+
+def outage_lines(gaps: list[tuple[float, float]], tz: tzinfo, limit: int = 10,
+                 lan_gaps: list[tuple[float, float]] | None = None) -> list[str]:
     """When each outage actually started and ended, in wall-clock time."""
     today = datetime.now(tz).date()
     lines = []
@@ -82,7 +108,7 @@ def outage_lines(gaps: list[tuple[float, float]], tz: tzinfo, limit: int = 10) -
         lines.append(
             f"      down {clock(start, tz, starts.date() != today)} -> "
             f"{clock(end, tz, ends.date() != starts.date())} {ends.strftime('%Z')}"
-            f"  ({end - start:.3f}s)"
+            f"  ({end - start:.3f}s){blame(start, end, lan_gaps)}"
         )
     if len(gaps) > limit:
         lines.append(f"      ... and {len(gaps) - limit} more")
@@ -116,7 +142,7 @@ def use_colour(mode: str) -> bool:
     return mode == "always" or sys.stdout.isatty()
 
 
-def render_slice(sent: int, lost: int, colour: bool) -> str:
+def render_slice(sent: int, lost: int, colour: bool, lan_lost: bool = False) -> str:
     """One character summarising a slice of wall time."""
     if sent <= 0:
         _label, char, code = NO_DATA
@@ -125,6 +151,8 @@ def render_slice(sent: int, lost: int, colour: bool) -> str:
         for bound, _label, char, code in TRACE_LEVELS:
             if ratio <= bound:
                 break
+    if lan_lost:                              # the gateway lost probes too: local
+        char, code = "L", 201
     return paint(DOT, code) if colour else char
 
 
@@ -135,6 +163,7 @@ def legend(colour: bool) -> str:
     ]
     label, char, code = NO_DATA
     parts.append((paint(DOT, code) if colour else char) + " " + label)
+    parts.append((paint(DOT, 201) if colour else "L") + " gateway lost too")
     return "   ".join(parts)
 
 
@@ -144,10 +173,13 @@ def legend(colour: bool) -> str:
 class Prober:
     """Shared accounting: every probe is reconciled, losses and outages logged."""
 
-    def __init__(self, args: argparse.Namespace, stop: threading.Event, fh) -> None:
+    def __init__(self, args: argparse.Namespace, stop: threading.Event, journal,
+                 lane: str = WAN, host: str | None = None) -> None:
         self.args = args
         self.stop = stop
-        self.fh = fh
+        self.journal = journal
+        self.lane = lane
+        self.host = host or args.host
         # probe id -> [monotonic ts unanswered, wall ts, last reply before it,
         #              first reply after it]  - intervals are monotonic so that a
         #              wall-clock step cannot invent an outage
@@ -161,7 +193,9 @@ class Prober:
 
     # -- log writing ------------------------------------------------------- #
     def write(self, ts: float, kind: str, *fields: object) -> None:
-        self.fh.write(f"{ts:.6f}\t{kind}\t" + "\t".join(str(f) for f in fields) + "\n")
+        self.journal.write(
+            f"{ts:.6f}\t{self.lane}\t{kind}\t" + "\t".join(str(f) for f in fields) + "\n"
+        )
 
     def on_success(self, mono: float, wall: float, ident: int, rtt: float | None) -> None:
         self.pending.pop(ident, None)             # a late reply is still a reply
@@ -243,11 +277,12 @@ class IcmpProber(Prober):
 
     def command(self) -> list[str]:
         cmd = ["ping", "-D", "-O", "-n"]
-        if self.args.interval:
-            cmd += ["-i", str(self.args.interval)]
+        interval = self.args.gateway_interval if self.lane == LAN else self.args.interval
+        if interval:
+            cmd += ["-i", str(interval)]
         else:
             cmd += ["-A"]                         # flow as fast as the RTT allows
-        cmd += ["-W", str(self.args.timeout), self.args.host]
+        cmd += ["-W", str(self.args.timeout), self.host]
         return cmd
 
     def run(self) -> None:
@@ -423,9 +458,25 @@ class DnsProber(Prober):
 PROBERS = {"icmp": IcmpProber, "dns": DnsProber}
 
 
-def pinger(args: argparse.Namespace, stop: threading.Event) -> None:
-    with open(args.log, "a", buffering=1, encoding="utf-8") as fh:
-        PROBERS[args.probe](args, stop, fh).run()
+class Journal:
+    """One log file, written by every lane."""
+
+    def __init__(self, path: str) -> None:
+        self.fh = open(path, "a", buffering=1, encoding="utf-8")
+        self.lock = threading.Lock()
+
+    def write(self, line: str) -> None:
+        with self.lock:
+            self.fh.write(line)
+
+    def close(self) -> None:
+        self.fh.close()
+
+
+def pinger(args: argparse.Namespace, stop: threading.Event, journal: Journal,
+           lane: str = WAN, host: str | None = None) -> None:
+    prober = IcmpProber if lane == LAN else PROBERS[args.probe]
+    prober(args, stop, journal, lane, host).run()
 
 
 # --------------------------------------------------------------------------- #
@@ -496,7 +547,8 @@ class Bucket:
         inside = min(self.inside, self.lost)
         return inside, self.lost - inside
 
-    def report(self, label: str, unit: str, baseline: float, tz: tzinfo) -> list[str]:
+    def report(self, label: str, unit: str, baseline: float, tz: tzinfo,
+               lan: "Bucket | None" = None) -> list[str]:
         inside, isolated = self.split_losses()
         lost = self.lost
         loss_pct = 100 * lost / self.sent if self.sent else 0.0
@@ -513,7 +565,15 @@ class Bucket:
                 f"    {len(outages)} outage{'' if len(outages) == 1 else 's'}, "
                 f"longest {max(outages):.6f}s, shortest {min(outages):.6f}s"
             )
-            lines.extend(outage_lines(self.gaps, tz))
+            lines.extend(outage_lines(self.gaps, tz, lan_gaps=lan.gaps if lan else None))
+            if lan is not None:
+                upstream = [g for g in self.gaps if not blame(*g, lan.gaps).startswith("  [gateway un")]
+                lines.append(
+                    f"    gateway control lane: {lan.sent:,} probes, {lan.lost:,} lost "
+                    f"({100 * lan.lost / lan.sent if lan.sent else 0:.3f}%), "
+                    f"{len(lan.gaps)} gateway outage{'' if len(lan.gaps) == 1 else 's'}"
+                    f"  -> {len(upstream)} of {len(self.gaps)} outages were upstream of your router"
+                )
         if outages and baseline and self.sent and self.span > baseline:
             probes = self.span / baseline
             caught = sum(min(1.0, out / baseline) for out in outages)
@@ -539,14 +599,20 @@ def style(text: str) -> tuple[int, bool]:
     return (196, True) if text.startswith("Internet was down") else (244, False)
 
 
-def parse_line(line: str) -> tuple[float, str, list[str]] | None:
+def parse_line(line: str) -> tuple[float, str, str, list[str]] | None:
+    """(ts, lane, kind, fields). Records written before lanes existed are wan."""
     parts = line.rstrip("\n").split("\t")
     if len(parts) < 2:
         return None
     try:
-        return float(parts[0]), parts[1], parts[2:]
+        ts = float(parts[0])
     except ValueError:
         return None
+    if parts[1] in KINDS:
+        return ts, WAN, parts[1], parts[2:]
+    if len(parts) > 2 and parts[2] in KINDS:
+        return ts, parts[1], parts[2], parts[3:]
+    return None
 
 
 def reader(args: argparse.Namespace, stop: threading.Event, start: float) -> None:
@@ -556,34 +622,43 @@ def reader(args: argparse.Namespace, stop: threading.Event, start: float) -> Non
     progress = args.progress and sys.stdout.isatty()
     countdown_max = max(1, min(9, int(args.slice)))   # 1..5 for the default 5s slice
     slice_started = time.monotonic()
-    window = Bucket()
-    day = Bucket()
+    lanes = (WAN, LAN)
+    window = {lane: Bucket() for lane in lanes}
+    day = {lane: Bucket() for lane in lanes}
+    lan_trouble = [False]                   # gateway lost probes since the last dot
     next_window = start + args.report_every
     next_day = start + args.daily
     windows = days = 0
 
     nonlocal_slice = [slice_started]        # last slice boundary, for the countdown
 
-    def apply(record: tuple[float, str, list[str]]) -> None:
-        _ts, kind, rest = record
+    def apply(record: tuple[float, str, str, list[str]]) -> None:
+        _ts, lane, kind, rest = record
+        if lane not in window:
+            return
+        buckets = (window[lane], day[lane])
         if kind == SLICE:
             sent, lost = int(rest[0]), int(rest[1])
             inside = int(rest[2]) if len(rest) > 2 and rest[2].isdigit() else 0
-            for bucket in (window, day):
+            for bucket in buckets:
                 bucket.sent += sent
                 bucket.lost += lost
                 bucket.inside += inside
-            screen.mark(render_slice(sent, lost, colour))
-            nonlocal_slice[0] = time.monotonic()
+            if lane == LAN:
+                lan_trouble[0] = lan_trouble[0] or lost > 0
+            else:                            # the trace follows the internet lane
+                screen.mark(render_slice(sent, lost, colour, lan_trouble[0]))
+                lan_trouble[0] = False
+                nonlocal_slice[0] = time.monotonic()
         elif kind == GAP:
             duration = float(rest[0])
-            for bucket in (window, day):
+            for bucket in buckets:
                 bucket.gaps.append((_ts - duration, _ts))
         elif kind == SKEW:
-            for bucket in (window, day):
+            for bucket in buckets:
                 bucket.skews.append(float(rest[0]))
         elif kind == RESTART:
-            for bucket in (window, day):
+            for bucket in buckets:
                 bucket.restarts += 1
 
     with open(args.log, "r", encoding="utf-8") as fh:
@@ -592,33 +667,37 @@ def reader(args: argparse.Namespace, stop: threading.Event, start: float) -> Non
             now = time.monotonic()
             if now >= next_window:
                 windows += 1
-                window.span = args.report_every
-                if window.lost or window.restarts or window.skews:
-                    for text in window.report(
+                wan, lan = window[WAN], window[LAN]
+                wan.span = lan.span = args.report_every
+                if wan.lost or wan.restarts or wan.skews or lan.lost:
+                    for text in wan.report(
                         f"window {windows} ({args.report_every / 3600:g}h)",
                         args.window_unit,
                         args.baseline,
                         tz,
+                        lan if lan.sent else None,
                     ):
                         screen.message(text, *style(text))
-                window = Bucket()
+                window = {lane: Bucket() for lane in lanes}
                 next_window += args.report_every
             if now >= next_day:
                 days += 1
-                day.span = args.daily
+                wan, lan = day[WAN], day[LAN]
+                wan.span = lan.span = args.daily
                 header = f"day {days} ({args.daily / 3600:g}h)"
-                if day.lost or day.restarts or day.skews:
-                    for text in day.report(header, "hours", args.baseline, tz):
+                if wan.lost or wan.restarts or wan.skews or lan.lost:
+                    for text in wan.report(header, "hours", args.baseline, tz,
+                                           lan if lan.sent else None):
                         screen.message(text, *style(text))
-                    if not day.gaps:
+                    if not wan.gaps:
                         screen.message(
                             "    the internet never went down, only single packets dropped", 244
                         )
                 else:
                     screen.message(
-                        f"Internet was up for the whole {header}: {day.sent:,} pings, 0 lost.", 46
+                        f"Internet was up for the whole {header}: {wan.sent:,} probes, 0 lost.", 46
                     )
-                day = Bucket()
+                day = {lane: Bucket() for lane in lanes}
                 next_day += args.daily
 
             if progress:                        # count the seconds until the next dot
@@ -642,7 +721,7 @@ def reader(args: argparse.Namespace, stop: threading.Event, start: float) -> Non
 # offline analysis of an existing log
 # --------------------------------------------------------------------------- #
 def summarize(args: argparse.Namespace) -> int:
-    total = Bucket()
+    totals = {WAN: Bucket(), LAN: Bucket()}
     first = last = None
     loss_ts: list[float] = []
     unverified: list[tuple[float, float]] = []      # logs written before GAP carried a count
@@ -652,7 +731,10 @@ def summarize(args: argparse.Namespace) -> int:
                 record = parse_line(line)
                 if not record:
                     continue
-                ts, kind, rest = record
+                ts, lane, kind, rest = record
+                if lane not in totals:
+                    continue
+                total = totals[lane]
                 first = ts if first is None else first
                 last = ts
                 if kind == SLICE:
@@ -661,7 +743,8 @@ def summarize(args: argparse.Namespace) -> int:
                     if len(rest) > 2 and rest[2].isdigit():
                         total.inside += int(rest[2])
                 elif kind == LOSS:
-                    loss_ts.append(ts)
+                    if lane == WAN:
+                        loss_ts.append(ts)
                 elif kind == GAP:
                     duration = float(rest[0])
                     if len(rest) < 2:
@@ -683,6 +766,7 @@ def summarize(args: argparse.Namespace) -> int:
 
     # Older logs recorded a silence without saying whether any probe was lost in
     # it. Check them the same way: a real outage has to swallow probes.
+    total, lan = totals[WAN], totals[LAN]
     if unverified:
         loss_ts.sort()
         for start, end in unverified:
@@ -704,14 +788,17 @@ def summarize(args: argparse.Namespace) -> int:
         print(f"Probes:  {total.sent:,} ({rate:.1f}/s), {total.lost:,} lost "
               f"({100 * total.lost / total.sent:.3f}%) = {inside:,} inside outages "
               f"+ {isolated:,} isolated drops")
+    if lan.sent:
+        print(f"Gateway: {lan.sent:,} probes, {lan.lost:,} lost "
+              f"({100 * lan.lost / lan.sent:.3f}%), {len(lan.gaps)} gateway outages")
     if total.gaps:
-        for text in total.report("total", "auto", args.baseline, tz):
+        for text in total.report("total", "auto", args.baseline, tz, lan if lan.sent else None):
             print(text)
         print("Longest outages:")
         for i, (start, end) in enumerate(
             sorted(total.gaps, key=lambda g: g[1] - g[0], reverse=True)[:10], 1
         ):
-            print(f"  {i:2}. {outage_lines([(start, end)], tz)[0].strip()}")
+            print(f"  {i:2}. {outage_lines([(start, end)], tz, lan_gaps=lan.gaps if lan.sent else None)[0].strip()}")
     elif total.lost:
         print(f"Drops:   {total.lost:,} isolated packets, no run longer than {args.gap:g}s")
         print("The internet never went down.")
@@ -745,7 +832,7 @@ def measure_icmp(args: argparse.Namespace, interval: float, seconds: float) -> t
 
 def measure_dns(args: argparse.Namespace, interval: float, seconds: float) -> tuple[int, int]:
     """Send cached DNS queries at a fixed rate and count the answers."""
-    prober = DnsProber(args, threading.Event(), open(os.devnull, "w"))
+    prober = DnsProber(args, threading.Event(), Journal(os.devnull))
     question = prober.query(args.query_name)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
@@ -851,6 +938,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="seconds without a reply that counts as an outage (default: 1)")
     parser.add_argument("--slice", type=float, default=5.0,
                         help="seconds of pings summarised by one trace character (default: 5)")
+    parser.add_argument("--gateway", default="auto", metavar="IP",
+                        help="also probe this address as a control lane, so an outage can be "
+                             "blamed on the LAN or on the ISP; 'auto' finds the default route, "
+                             "'off' disables it (default: auto)")
+    parser.add_argument("--gateway-interval", type=float, default=0.05,
+                        help="seconds between gateway probes (default: 0.05 = 20/s)")
     parser.add_argument("--log", default="net-checker.log", help="log file path")
     parser.add_argument("--log-mode", choices=("events", "all"), default="events",
                         help="'events' logs losses/outages/slices, 'all' also logs every reply")
@@ -879,6 +972,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--calibrate-tolerance", type=float, default=1.0,
                         help="extra loss %% over the floor still considered clean (default: 1)")
     args = parser.parse_args(argv)
+    if args.gateway == "auto":
+        args.gateway = default_gateway()
+    elif args.gateway == "off":
+        args.gateway = None
     if args.interval is None:
         args.interval = 0.05 if args.probe == "icmp" else 0.01
     return args
@@ -891,22 +988,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.summarize:
         return summarize(args)
 
-    open(args.log, "a", encoding="utf-8").close()
+    journal = Journal(args.log)
     start = time.monotonic()
     stop = threading.Event()
     cadence = (f"every {args.interval:g}s ({1 / args.interval:.0f}/s)" if args.interval
                else "adaptive (one packet per round trip)")
     target = args.host if args.probe == "icmp" else f"DNS {args.query_name} @ {args.resolver}"
+    control = (f"Gateway control lane: {args.gateway} every {args.gateway_interval:g}s\n"
+               if args.gateway else
+               "No gateway lane: an outage cannot be blamed on the ISP rather than your LAN\n")
     print(
         f"Watching {target} with {args.probe} probes, {cadence} -> {args.log}\n"
+        f"{control}"
         f"One character per {args.slice:g}s:  {legend(use_colour(args.color))}\n"
         f"Summary every {args.report_every / 3600:g}h, roll-up every {args.daily / 3600:g}h. Ctrl-C to stop."
     )
 
     threads = [
-        threading.Thread(target=pinger, args=(args, stop), name="pinger", daemon=True),
+        threading.Thread(target=pinger, args=(args, stop, journal), name="wan", daemon=True),
         threading.Thread(target=reader, args=(args, stop, start), name="reader", daemon=True),
     ]
+    if args.gateway:
+        threads.insert(1, threading.Thread(
+            target=pinger, args=(args, stop, journal, LAN, args.gateway), name="lan", daemon=True
+        ))
     for thread in threads:
         thread.start()
 
@@ -922,6 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
         stop.set()
         for thread in threads:
             thread.join(timeout=5)
+        journal.close()
 
     print()
     return summarize(args)

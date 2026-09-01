@@ -89,6 +89,29 @@ says so if the link polices ICMP. `--interval 0` uses `ping -A` (one packet per
 round trip, ~70/s) if you want it fully free-flowing and accept the rate-limit
 noise. To measure without any ICMP limit at all, use `--probe dns` above.
 
+## Proving whose fault it was
+
+A single probe stream cannot tell "the internet went down" from "my Wi-Fi
+hiccuped" or "this machine stalled". So a second thread probes the default
+gateway in parallel, on the same log, as a control lane:
+
+```
+      down 10:02:55.310 -> 10:03:42.531 PDT  (47.221s)  [gateway stayed up -> the fault is upstream of your router]
+      down 11:48:30.902 -> 11:49:12.114 PDT  (41.212s)  [gateway unreachable too -> your LAN or this machine, not the ISP]
+    gateway control lane: 1,036,800 probes, 12 lost (0.001%), 1 gateway outage
+      -> 1 of 2 outages were upstream of your router
+```
+
+The gateway answers in well under a millisecond and takes 100 probes/s without
+loss, so if it kept replying while the internet lane went silent, the fault was
+past your router — which is the first thing an ISP will ask. The trace marks
+any slice where the gateway lost probes too, so local trouble is visible as it
+happens rather than only in the summary.
+
+`--gateway auto` (the default) reads the default route; pass an address to
+override, or `off` to disable the lane. Every log record carries its lane, so
+one log holds both streams.
+
 ## What it refuses to call an outage
 
 Two invariants keep measurement artifacts out of the numbers.
@@ -159,7 +182,7 @@ falls back to `. , : x #` (as does any non-tty, or `NO_COLOR`).
 
 ## How it works
 
-Two threads:
+Three threads (two when `--gateway off`):
 
 1. **pinger** — runs the chosen probe and reconciles every packet it sends
    against the replies that come back (a late reply still counts as a reply; a
@@ -173,8 +196,11 @@ Two threads:
    `--probe icmp` keeps one `ping -D -O -n` process alive and
    tracks `icmp_seq`; `--probe dns` sends DNS queries on a non-blocking UDP
    socket and tracks the transaction id.
-2. **reader** — tails that log file, prints the trace character per slice, and
-   at each 4-hour and 24-hour boundary prints the downtime summary.
+2. **gateway pinger** — the same, ICMP against the default route, tagged as the
+   `lan` lane in the same log.
+3. **reader** — tails that log file, prints the trace character per slice, and
+   at each 4-hour and 24-hour boundary prints the downtime summary, blaming
+   each outage on the ISP or the LAN by whether the two lanes failed together.
 
 If the ping process dies (DNS failure when the link is fully down, for example)
 it is respawned, and the time it was gone still lands in the next `GAP`.
@@ -184,6 +210,8 @@ it is respawned, and the time it was gone still lands in the next `GAP`.
 | flag | default | meaning |
 | --- | --- | --- |
 | `--probe` | `icmp` | `icmp` (ping) or `dns` (UDP DNS, not rate limited) |
+| `--gateway` | `auto` | control lane address; `auto` = default route, `off` = none |
+| `--gateway-interval` | `0.05` | seconds between gateway probes |
 | `--host` | `google.com` | host to ping (`--probe icmp`) |
 | `--resolver` | `1.1.1.1` | resolver to query (`--probe dns`) |
 | `--resolver-port` | `53` | resolver port |
