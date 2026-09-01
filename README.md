@@ -89,6 +89,31 @@ says so if the link polices ICMP. `--interval 0` uses `ping -A` (one packet per
 round trip, ~70/s) if you want it fully free-flowing and accept the rate-limit
 noise. To measure without any ICMP limit at all, use `--probe dns` above.
 
+## What it refuses to call an outage
+
+Two invariants keep measurement artifacts out of the numbers.
+
+**All intervals are measured on the monotonic clock.** Wall-clock time is used
+only for printing. This matters more than it sounds: on a WSL2 VM this tool
+recorded 1,740 "outages" over 16 hours that were really the host stepping the
+guest clock — 47 of those steps ran the clock *backwards* by about 14 minutes
+each, erasing 11.7 hours from a 16-hour run and producing negative round-trip
+times. A monotonic clock cannot be stepped, so none of that can reach a report.
+
+**A silence with nothing lost is not an outage.** A real outage swallows
+probes: at 100/s, a 1.7-second outage has to lose about 170 of them. When the
+stream goes quiet but every probe sent during the quiet period is eventually
+answered, the process or the clock stalled — the link did not go down. Those
+are logged as `SKEW`, kept out of the downtime total, and reported separately:
+
+```
+    ignored 1738 timing anomalies totalling 49.53 minutes - silence with no probe
+    lost, so the clock stepped or the process stalled, the link did not go down
+```
+
+`--summarize` applies the same test retroactively to logs written before the
+`GAP` record carried its unanswered count.
+
 ## What it reports
 
 A single dropped packet is not an outage. Every lost packet is logged with its
@@ -141,7 +166,8 @@ Two threads:
    probe unanswered after `--timeout` is a loss), appending microsecond-stamped
    records to the log: `LOSS`, `GAP` (a recovered outage and its exact length),
    `SLICE` (per-slice counters), `RESTART`. `--log-mode all` also logs every
-   individual reply. Each lost probe is classified as it is retired: inside an
+   individual reply, and a silence that lost nothing is logged as `SKEW` rather
+   than `GAP`. Each lost probe is classified as it is retired: inside an
    outage if the silence it fell into — from the last reply before it to the
    first reply after it — lasted at least `--gap`, otherwise an isolated drop.
    `--probe icmp` keeps one `ping -D -O -n` process alive and

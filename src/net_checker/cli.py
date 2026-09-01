@@ -12,6 +12,7 @@ Two worker threads:
 from __future__ import annotations
 
 import argparse
+import bisect
 import os
 import re
 import selectors
@@ -34,10 +35,12 @@ PENDING_RE = re.compile(r"^\[(\d+\.\d+)\] no answer yet for icmp_seq=(\d+)")
 ERROR_RE = re.compile(r"^\[(\d+\.\d+)\] From .*icmp_seq=(\d+)\s+(\S.*)$")
 
 # Log record types.
-PING = "PING"      # ts, seq, rtt_ms          (only with --log-mode all)
-LOSS = "LOSS"      # ts, seq
-SLICE = "SLICE"    # ts, sent, lost, span, min_rtt, avg_rtt, max_rtt
-GAP = "GAP"        # ts (recovery), duration
+PING = "PING"      # ts, seq, rtt_ms                 (only with --log-mode all)
+LOSS = "LOSS"      # ts, seq, lost_inside_an_outage
+SLICE = "SLICE"    # ts, sent, lost, lost_inside, span, min_rtt, avg_rtt, max_rtt
+GAP = "GAP"        # ts (recovery), duration, probes left unanswered
+SKEW = "SKEW"      # ts, duration, 0 - silence with nothing lost: a clock step or
+                   #     a stalled process, never an outage
 RESTART = "RESTART"  # ts, reason
 
 
@@ -145,11 +148,14 @@ class Prober:
         self.args = args
         self.stop = stop
         self.fh = fh
-        # probe id -> [ts it went unanswered, last reply before it, first reply after it]
+        # probe id -> [monotonic ts unanswered, wall ts, last reply before it,
+        #              first reply after it]  - intervals are monotonic so that a
+        #              wall-clock step cannot invent an outage
         self.pending: dict[int, list[float | None]] = {}
         self.unstamped: deque[list[float | None]] = deque()
-        self.last_success: float | None = None
-        self.slice_start: float | None = None
+        self.last_success: float | None = None          # monotonic
+        self.last_success_wall: float | None = None
+        self.slice_start: float | None = None           # monotonic
         self.sent = self.lost = self.lost_in_outage = 0
         self.rtts: list[float] = []
 
@@ -157,28 +163,37 @@ class Prober:
     def write(self, ts: float, kind: str, *fields: object) -> None:
         self.fh.write(f"{ts:.6f}\t{kind}\t" + "\t".join(str(f) for f in fields) + "\n")
 
-    def on_success(self, ts: float, ident: int, rtt: float | None) -> None:
+    def on_success(self, mono: float, wall: float, ident: int, rtt: float | None) -> None:
         self.pending.pop(ident, None)             # a late reply is still a reply
         while self.unstamped:                     # this is the first reply after them
-            self.unstamped.popleft()[2] = ts
+            self.unstamped.popleft()[3] = mono
         if rtt is not None:
             self.rtts.append(rtt)
             if self.args.log_mode == "all":
-                self.write(ts, PING, ident, f"{rtt:.3f}")
+                self.write(wall, PING, ident, f"{rtt:.3f}")
         if self.last_success is not None:
-            gap = ts - self.last_success
+            gap = mono - self.last_success
             if gap >= self.args.gap:
-                self.write(ts, GAP, f"{gap:.6f}")
-        self.last_success = ts
+                # A real outage swallows probes. If every probe sent during the
+                # silence was answered, nothing was down - the process or the
+                # clock stalled - so record it as skew and keep it out of the
+                # downtime total.
+                unanswered = sum(
+                    1 for entry in self.pending.values()
+                    if entry[0] is not None and entry[0] > self.last_success
+                )
+                self.write(wall, GAP if unanswered else SKEW, f"{gap:.6f}", unanswered)
+        self.last_success = mono
+        self.last_success_wall = wall
 
-    def mark_pending(self, ident: int, ts: float) -> None:
+    def mark_pending(self, ident: int, mono: float, wall: float) -> None:
         if ident in self.pending:
             return
-        entry: list[float | None] = [ts, self.last_success, None]
+        entry: list[float | None] = [mono, wall, self.last_success, None]
         self.pending[ident] = entry
         self.unstamped.append(entry)
 
-    def declare_lost(self, ident: int, ts: float, base: float | None,
+    def declare_lost(self, ident: int, wall: float, base: float | None,
                      after: float | None, now: float) -> None:
         """Lost inside an outage if the silence around it lasted at least --gap.
 
@@ -189,23 +204,23 @@ class Prober:
         in_outage = base is not None and (after or now) - base >= self.args.gap
         self.lost += 1
         self.lost_in_outage += in_outage
-        self.write(ts, LOSS, ident, int(in_outage))
+        self.write(wall, LOSS, ident, int(in_outage))
 
-    def tick(self, now: float) -> None:
-        """Retire timed-out probes and flush the current slice."""
+    def tick(self, now: float, wall: float) -> None:
+        """Retire timed-out probes and flush the current slice. `now` is monotonic."""
         if self.slice_start is None:
             self.slice_start = now
-        for ident, (ts, base, after) in list(self.pending.items()):
-            if now - ts < self.args.timeout:
+        for ident, (mono, sent_wall, base, after) in list(self.pending.items()):
+            if now - mono < self.args.timeout:
                 continue
             if after is None and base is not None and now - base < self.args.gap:
                 continue                          # too early to tell; decide next tick
             del self.pending[ident]
-            self.declare_lost(ident, ts, base, after, now)
+            self.declare_lost(ident, sent_wall, base, after, now)
         if now - self.slice_start >= self.args.slice:
             span, rtts = now - self.slice_start, self.rtts
             self.write(
-                now,
+                wall,
                 SLICE,
                 self.sent,
                 self.lost,
@@ -271,13 +286,13 @@ class IcmpProber(Prober):
                 for _key, _mask in sel.select(timeout=0.2):
                     chunk = os.read(proc.stdout.fileno(), 65536)
                     if not chunk:
-                        self.tick(time.time())
+                        self.tick(time.monotonic(), time.time())
                         return "ping stream ended"
                     buf += chunk
                     *lines, buf = buf.split(b"\n")
                     for raw in lines:
                         self.handle(raw.decode("utf-8", "replace"))
-                self.tick(time.time())
+                self.tick(time.monotonic(), time.time())
                 if proc.poll() is not None:
                     return f"ping exited with code {proc.returncode}"
             return "stopped"
@@ -290,27 +305,33 @@ class IcmpProber(Prober):
             self.sent += seq - self.last_seq
             self.last_seq = seq
 
+    @staticmethod
+    def monotonic_of(wall_ts: float) -> float:
+        """ping stamps its lines with the wall clock; anchor them to monotonic now."""
+        return time.monotonic() - (time.time() - wall_ts)
+
     def handle(self, line: str) -> None:
         match = REPLY_RE.match(line)
         if match:
             ts, seq, rtt = float(match[1]), int(match[2]), float(match[3])
             self.count_seq(seq)
-            self.on_success(ts, seq, rtt)
+            self.on_success(self.monotonic_of(ts), ts, seq, rtt)
             return
 
         match = PENDING_RE.match(line)
         if match:
             ts, seq = float(match[1]), int(match[2])
             self.count_seq(seq)
-            self.mark_pending(seq, ts)
+            self.mark_pending(seq, self.monotonic_of(ts), ts)
             return
 
         match = ERROR_RE.match(line)
         if match:                                 # host/net unreachable: lost now
             ts, seq = float(match[1]), int(match[2])
+            mono = self.monotonic_of(ts)
             self.count_seq(seq)
-            _ts, base, after = self.pending.pop(seq, [ts, self.last_success, None])
-            self.declare_lost(seq, ts, base, after, ts)
+            _m, _w, base, after = self.pending.pop(seq, [mono, ts, self.last_success, None])
+            self.declare_lost(seq, ts, base, after, mono)
 
 
 class DnsProber(Prober):
@@ -356,22 +377,22 @@ class DnsProber(Prober):
     def pump(self, sock: socket.socket, question: bytes, interval: float) -> str:
         sel = selectors.DefaultSelector()
         sel.register(sock, selectors.EVENT_READ)
-        next_send = time.time()
+        next_send = time.monotonic()
         try:
             while not self.stop.is_set():
-                now = time.time()
+                now = time.monotonic()
                 if now >= next_send:
                     self.txid = (self.txid + 1) & 0xFFFF
                     packet = struct.pack(">HHHHHH", self.txid, 0x0100, 1, 0, 0, 0) + question
                     try:
                         sock.send(packet)
                         self.sent += 1
-                        self.mark_pending(self.txid, now)
+                        self.mark_pending(self.txid, now, time.time())
                     except BlockingIOError:
                         pass
                     except OSError as exc:        # network unreachable, etc.
                         self.sent += 1
-                        self.declare_lost(self.txid, now, self.last_success, None, now)
+                        self.declare_lost(self.txid, time.time(), self.last_success, None, now)
                         # ENETUNREACH / ECONNREFUSED / EHOSTUNREACH / EINVAL all mean
                         # "not right now", which is a lost probe, not a broken socket.
                         if exc.errno not in (101, 111, 113, 22):
@@ -380,7 +401,7 @@ class DnsProber(Prober):
                     if next_send < now - 1:       # fell far behind; resynchronise
                         next_send = now + interval
 
-                if sel.select(timeout=max(0.0, min(next_send - time.time(), 0.05))):
+                if sel.select(timeout=max(0.0, min(next_send - time.monotonic(), 0.05))):
                     while True:
                         try:
                             data = sock.recv(2048)
@@ -388,12 +409,12 @@ class DnsProber(Prober):
                             break
                         if len(data) < 4 or not data[2] & 0x80:   # not a response
                             continue
-                        now = time.time()
+                        now = time.monotonic()
                         txid = struct.unpack(">H", data[:2])[0]
                         entry = self.pending.get(txid)
                         rtt = (now - entry[0]) * 1000 if entry else None
-                        self.on_success(now, txid, rtt)
-                self.tick(time.time())
+                        self.on_success(now, time.time(), txid, rtt)
+                self.tick(time.monotonic(), time.time())
             return "stopped"
         finally:
             sel.close()
@@ -459,6 +480,7 @@ class Bucket:
     inside: int = 0                                        # lost while an outage was running
     span: float = 0.0
     gaps: list[tuple[float, float]] = field(default_factory=list)  # (start, end) of each outage
+    skews: list[float] = field(default_factory=list)   # silences with nothing lost
     restarts: int = 0
 
     @property
@@ -500,6 +522,13 @@ class Bucket:
                 f"({self.sent / probes:.0f}x fewer) and expected to catch "
                 f"{caught:.2f} of these {len(outages)} outages"
             )
+        if self.skews:
+            lines.append(
+                f"    ignored {len(self.skews)} timing anomal"
+                f"{'y' if len(self.skews) == 1 else 'ies'} totalling "
+                f"{humanize(sum(self.skews), 'auto')} - silence with no probe lost, so the"
+                " clock stepped or the process stalled, the link did not go down"
+            )
         if self.restarts:
             lines.append(f"    ping restarted {self.restarts} time(s)")
         return lines
@@ -526,7 +555,7 @@ def reader(args: argparse.Namespace, stop: threading.Event, start: float) -> Non
     tz = zone(args.timezone)
     progress = args.progress and sys.stdout.isatty()
     countdown_max = max(1, min(9, int(args.slice)))   # 1..5 for the default 5s slice
-    slice_started = time.time()
+    slice_started = time.monotonic()
     window = Bucket()
     day = Bucket()
     next_window = start + args.report_every
@@ -545,11 +574,14 @@ def reader(args: argparse.Namespace, stop: threading.Event, start: float) -> Non
                 bucket.lost += lost
                 bucket.inside += inside
             screen.mark(render_slice(sent, lost, colour))
-            nonlocal_slice[0] = time.time()
+            nonlocal_slice[0] = time.monotonic()
         elif kind == GAP:
             duration = float(rest[0])
             for bucket in (window, day):
                 bucket.gaps.append((_ts - duration, _ts))
+        elif kind == SKEW:
+            for bucket in (window, day):
+                bucket.skews.append(float(rest[0]))
         elif kind == RESTART:
             for bucket in (window, day):
                 bucket.restarts += 1
@@ -557,11 +589,11 @@ def reader(args: argparse.Namespace, stop: threading.Event, start: float) -> Non
     with open(args.log, "r", encoding="utf-8") as fh:
         fh.seek(0, os.SEEK_END)
         while not stop.is_set():
-            now = time.time()
+            now = time.monotonic()
             if now >= next_window:
                 windows += 1
                 window.span = args.report_every
-                if window.lost or window.restarts:
+                if window.lost or window.restarts or window.skews:
                     for text in window.report(
                         f"window {windows} ({args.report_every / 3600:g}h)",
                         args.window_unit,
@@ -575,7 +607,7 @@ def reader(args: argparse.Namespace, stop: threading.Event, start: float) -> Non
                 days += 1
                 day.span = args.daily
                 header = f"day {days} ({args.daily / 3600:g}h)"
-                if day.lost or day.restarts:
+                if day.lost or day.restarts or day.skews:
                     for text in day.report(header, "hours", args.baseline, tz):
                         screen.message(text, *style(text))
                     if not day.gaps:
@@ -612,6 +644,8 @@ def reader(args: argparse.Namespace, stop: threading.Event, start: float) -> Non
 def summarize(args: argparse.Namespace) -> int:
     total = Bucket()
     first = last = None
+    loss_ts: list[float] = []
+    unverified: list[tuple[float, float]] = []      # logs written before GAP carried a count
     try:
         with open(args.log, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -626,8 +660,18 @@ def summarize(args: argparse.Namespace) -> int:
                     total.lost += int(rest[1])
                     if len(rest) > 2 and rest[2].isdigit():
                         total.inside += int(rest[2])
+                elif kind == LOSS:
+                    loss_ts.append(ts)
                 elif kind == GAP:
-                    total.gaps.append((ts - float(rest[0]), ts))
+                    duration = float(rest[0])
+                    if len(rest) < 2:
+                        unverified.append((ts - duration, ts))
+                    elif int(rest[1]):
+                        total.gaps.append((ts - duration, ts))
+                    else:
+                        total.skews.append(duration)
+                elif kind == SKEW:
+                    total.skews.append(float(rest[0]))
                 elif kind == RESTART:
                     total.restarts += 1
     except FileNotFoundError:
@@ -636,6 +680,16 @@ def summarize(args: argparse.Namespace) -> int:
     if first is None:
         print("Log is empty.")
         return 0
+
+    # Older logs recorded a silence without saying whether any probe was lost in
+    # it. Check them the same way: a real outage has to swallow probes.
+    if unverified:
+        loss_ts.sort()
+        for start, end in unverified:
+            if bisect.bisect_right(loss_ts, end) - bisect.bisect_left(loss_ts, start):
+                total.gaps.append((start, end))
+            else:
+                total.skews.append(end - start)
 
     tz = zone(args.timezone)
     total.span = last - first
@@ -663,6 +717,11 @@ def summarize(args: argparse.Namespace) -> int:
         print("The internet never went down.")
     else:
         print("Internet was never down.")
+    if total.skews:
+        print(f"\nIgnored: {len(total.skews):,} timing anomalies totalling "
+              f"{humanize(sum(total.skews), 'auto')} - stretches with no reply where no probe "
+              f"was lost either.\n         The clock stepped or the process stalled; the link "
+              f"did not go down.")
     return 0
 
 
@@ -695,11 +754,11 @@ def measure_dns(args: argparse.Namespace, interval: float, seconds: float) -> tu
     sel.register(sock, selectors.EVENT_READ)
     inflight: set[int] = set()
     sent = received = txid = 0
-    end = time.time() + seconds
-    next_send = time.time()
+    end = time.monotonic() + seconds
+    next_send = time.monotonic()
     try:
-        while time.time() < end + args.timeout:
-            now = time.time()
+        while time.monotonic() < end + args.timeout:
+            now = time.monotonic()
             if now >= next_send and now < end:
                 txid = (txid + 1) & 0xFFFF
                 try:
@@ -711,7 +770,7 @@ def measure_dns(args: argparse.Namespace, interval: float, seconds: float) -> tu
                 next_send += interval
                 if next_send < now - 1:
                     next_send = now + interval
-            if sel.select(timeout=max(0.0, min(next_send - time.time(), 0.02))):
+            if sel.select(timeout=max(0.0, min(next_send - time.monotonic(), 0.02))):
                 while True:
                     try:
                         data = sock.recv(2048)
@@ -833,7 +892,7 @@ def main(argv: list[str] | None = None) -> int:
         return summarize(args)
 
     open(args.log, "a", encoding="utf-8").close()
-    start = time.time()
+    start = time.monotonic()
     stop = threading.Event()
     cadence = (f"every {args.interval:g}s ({1 / args.interval:.0f}/s)" if args.interval
                else "adaptive (one packet per round trip)")
@@ -854,7 +913,7 @@ def main(argv: list[str] | None = None) -> int:
     deadline = start + args.duration * 3600 if args.duration else None
     try:
         while True:
-            if deadline and time.time() >= deadline:
+            if deadline and time.monotonic() >= deadline:
                 break
             time.sleep(0.2)
     except KeyboardInterrupt:
