@@ -128,6 +128,7 @@ TRACE_LEVELS = (
 )
 NO_DATA = ("no probes", "#", 244)    # grey
 DOT = "\u25cf"
+DIAMOND = "\u25c6"
 
 
 def paint(text: str, colour: int | None, bold: bool = False) -> str:
@@ -151,8 +152,10 @@ def render_slice(sent: int, lost: int, colour: bool, lan_lost: bool = False) -> 
         for bound, _label, char, code in TRACE_LEVELS:
             if ratio <= bound:
                 break
-    if lan_lost:                              # the gateway lost probes too: local
-        char, code = "L", 201
+    if lan_lost:
+        # Shape says the gateway lost probes too; the colour still reports the
+        # internet lane, so one glyph carries both facts.
+        return paint(DIAMOND, code) if colour else "L"
     return paint(DOT, code) if colour else char
 
 
@@ -163,7 +166,8 @@ def legend(colour: bool) -> str:
     ]
     label, char, code = NO_DATA
     parts.append((paint(DOT, code) if colour else char) + " " + label)
-    parts.append((paint(DOT, 201) if colour else "L") + " gateway lost too")
+    parts.append((paint(DIAMOND, 244) if colour else "L")
+                 + " gateway lost too (colour still shows the internet)")
     return "   ".join(parts)
 
 

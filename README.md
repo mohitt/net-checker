@@ -175,6 +175,11 @@ seconds:
 | 🔴 red | 10% or more lost |
 | ⚪ grey | no probes at all (the prober itself was down) |
 
+A slice where the **gateway** lost probes too is drawn as a diamond (`◆`)
+instead of a circle, keeping its colour — so the shape reports the gateway and
+the colour still reports the internet. A green diamond means the internet was
+perfect and only the router missed a ping.
+
 While a slice fills, the seconds count up in place — `1`, `2`, `3`, `4`, `5` —
 in the cell the dot is about to land in, so the line never grows until the dot
 replaces the digit. `--no-progress` turns the counter off; `--color never`
