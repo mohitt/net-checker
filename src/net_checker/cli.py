@@ -277,7 +277,7 @@ class IcmpProber(Prober):
 
     def __init__(self, *posargs) -> None:
         super().__init__(*posargs)
-        self.last_seq = 0                         # highest seq issued this run
+        self.last_seq = 0                         # last seq issued, mod 65,536
 
     def command(self) -> list[str]:
         cmd = ["ping", "-D", "-O", "-n"]
@@ -339,9 +339,18 @@ class IcmpProber(Prober):
             sel.close()
 
     def count_seq(self, seq: int) -> None:
-        """Every icmp_seq the process issues is counted exactly once."""
-        if seq > self.last_seq:
-            self.sent += seq - self.last_seq
+        """Every icmp_seq the process issues is counted exactly once.
+
+        ping prints the 16-bit sequence field, so probe 65,536 comes back
+        numbered 0 again. Fold that rollover in - left to a plain comparison the
+        send counter would stall for the rest of the run - while still ignoring
+        the small backwards steps that are just replies arriving out of order.
+        """
+        step = seq - self.last_seq
+        if step < -0x8000:                        # the sequence field rolled over
+            step += 0x10000
+        if step > 0:
+            self.sent += step
             self.last_seq = seq
 
     @staticmethod
