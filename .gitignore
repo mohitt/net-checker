@@ -11,3 +11,7 @@ wheels/
 
 # runtime logs
 *.log
+
+# personal measurement records and correspondence - not for the public repo
+xfinity-incidents.csv
+net-quality-evidence.html
