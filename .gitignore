@@ -15,3 +15,8 @@ wheels/
 # personal measurement records and correspondence - not for the public repo
 xfinity-incidents.csv
 net-quality-evidence.html
+
+# session handoff notes (local only)
+SESSION-STATE.md
+SUMMARY-*.txt
+log.md5
